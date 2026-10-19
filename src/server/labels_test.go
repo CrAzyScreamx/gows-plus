@@ -6,7 +6,6 @@ import (
 
 	"github.com/devlikeapro/gows/storage"
 	"go.mau.fi/whatsmeow/proto/waSyncAction"
-	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -44,19 +43,19 @@ func TestBuildListEdit(t *testing.T) {
 	}
 }
 
-type fakeLIDs struct{ store.LIDStore }
+type fakeLIDs struct{}
 
 var testPN = types.NewJID("972500000000", types.DefaultUserServer)
 var testLID = types.NewJID("100000000000001", types.HiddenUserServer)
 
-func (fakeLIDs) GetLIDForPN(_ context.Context, pn types.JID) (types.JID, error) {
+func (fakeLIDs) ResolveLidByPN(_ context.Context, pn types.JID) (types.JID, error) {
 	if pn == testPN {
 		return testLID, nil
 	}
 	return types.EmptyJID, nil
 }
 
-func (fakeLIDs) GetPNForLID(_ context.Context, lid types.JID) (types.JID, error) {
+func (fakeLIDs) ResolvePNByLid(_ context.Context, lid types.JID) (types.JID, error) {
 	if lid == testLID {
 		return testPN, nil
 	}
@@ -75,7 +74,8 @@ func TestChatJIDs(t *testing.T) {
 	if got := chatJIDs(ctx, fakeLIDs{}, group); len(got) != 1 {
 		t.Fatalf("group: got %v", got)
 	}
-	if got := chatJIDs(ctx, nil, testPN); len(got) != 1 {
-		t.Fatalf("no store: got %v", got)
+	other := types.NewJID("972511111111", types.DefaultUserServer)
+	if got := chatJIDs(ctx, fakeLIDs{}, other); len(got) != 1 {
+		t.Fatalf("unknown lid: got %v", got)
 	}
 }
