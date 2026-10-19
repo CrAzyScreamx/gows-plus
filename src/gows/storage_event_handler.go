@@ -416,9 +416,12 @@ func (st *StorageEventHandler) handleLabelEdit(event *events.LabelEdit) {
 
 	// Create
 	label := &storage.Label{
-		ID:    event.LabelID,
-		Name:  action.GetName(),
-		Color: int(action.GetColor()),
+		ID:           event.LabelID,
+		Name:         action.GetName(),
+		Color:        int(action.GetColor()),
+		Type:         int32(action.GetType()),
+		IsActive:     action.IsActive,
+		PredefinedID: action.GetPredefinedID(),
 	}
 
 	err := st.storage.Labels.UpsertLabel(label)

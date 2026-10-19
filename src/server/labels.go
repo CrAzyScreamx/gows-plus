@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"github.com/devlikeapro/gows/storage"
 	"go.mau.fi/whatsmeow/appstate"
+	"go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/types"
+	"google.golang.org/protobuf/proto"
 
 	__ "github.com/devlikeapro/gows/proto"
 )
@@ -30,6 +32,44 @@ func (s *Server) GetLabels(ctx context.Context, req *__.GetLabelsRequest) (*__.J
 	return response, nil
 }
 
+// buildListEdit is appstate.BuildLabelEdit plus the fields WhatsApp now needs
+// for labels to show up as "Lists": type and isActive (WA Web's labelAddAction
+// sends type=CUSTOM, isActive=true). Without them the phone shows a legacy label.
+// Edits keep the stored type/isActive/predefinedId so built-in lists stay intact.
+func buildListEdit(id string, name string, color int32, existing *storage.Label) appstate.PatchInfo {
+	listType := waSyncAction.LabelEditAction_CUSTOM
+	isActive := true
+	var predefinedID *int32
+	if existing != nil {
+		if existing.Type != 0 {
+			listType = waSyncAction.LabelEditAction_ListType(existing.Type)
+		}
+		if existing.IsActive != nil {
+			isActive = *existing.IsActive
+		}
+		if existing.PredefinedID != 0 {
+			predefinedID = proto.Int32(existing.PredefinedID)
+		}
+	}
+	return appstate.PatchInfo{
+		Type: appstate.WAPatchRegular,
+		Mutations: []appstate.MutationInfo{{
+			Index:   []string{appstate.IndexLabelEdit, id},
+			Version: 3,
+			Value: &waSyncAction.SyncActionValue{
+				LabelEditAction: &waSyncAction.LabelEditAction{
+					Name:         proto.String(name),
+					Color:        proto.Int32(color),
+					Deleted:      proto.Bool(false),
+					IsActive:     proto.Bool(isActive),
+					Type:         listType.Enum(),
+					PredefinedID: predefinedID,
+				},
+			},
+		}},
+	}
+}
+
 // UpsertLabel implements the gRPC method to create or update a label
 func (s *Server) UpsertLabel(ctx context.Context, req *__.UpsertLabelRequest) (*__.Empty, error) {
 	cli, err := s.Sm.Get(req.Session.Id)
@@ -39,7 +79,8 @@ func (s *Server) UpsertLabel(ctx context.Context, req *__.UpsertLabelRequest) (*
 
 	// Send app state update for label edit
 	label := req.Label
-	patch := appstate.BuildLabelEdit(label.Id, label.Name, label.Color, false)
+	existing, _ := cli.Storage.Labels.GetLabelById(label.Id)
+	patch := buildListEdit(label.Id, label.Name, label.Color, existing)
 	err = cli.SendAppState(ctx, patch)
 	if err != nil {
 		return nil, fmt.Errorf("error upserting label: %w", err)

@@ -93,6 +93,10 @@ type Label struct {
 	ID    string `json:"id"`
 	Name  string `json:"name"`
 	Color int    `json:"color"`
+	// WhatsApp "Lists" (formerly labels) - waSyncAction.LabelEditAction_ListType
+	Type         int32 `json:"type"`
+	IsActive     *bool `json:"isActive,omitempty"`
+	PredefinedID int32 `json:"predefinedId"`
 }
 
 // LabelAssociation represents an association between a label and a JID
