@@ -510,6 +510,7 @@ func (st *StorageEventHandler) handleLabelEdit(event *events.LabelEdit) {
 		Name:     action.GetName(),
 		Color:    int(action.GetColor()),
 		IsActive: action.IsActive,
+		PredefinedID: action.GetPredefinedID(),
 	}
 	if action.Type != nil {
 		labelType := int(action.GetType())

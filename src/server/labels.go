@@ -3,11 +3,13 @@ package server
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/devlikeapro/gows/storage"
 	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/types"
+	"google.golang.org/protobuf/proto"
 
 	__ "github.com/devlikeapro/gows/proto"
 )
@@ -32,6 +34,51 @@ func (s *Server) GetLabels(ctx context.Context, req *__.GetLabelsRequest) (*__.J
 	return response, nil
 }
 
+// buildListEdit is appstate.BuildLabelEdit plus the fields WhatsApp now needs
+// for labels to show up as "Lists": type and isActive (WA Web's labelAddAction
+// sends type=CUSTOM, isActive=true). Without them the phone shows a legacy label.
+// Edits and deletes keep the stored type/isActive/predefinedId so built-in lists stay intact.
+// Precedence: request (reqType/reqActive) > stored list > CUSTOM/active.
+func buildListEdit(id string, name string, color int32, deleted bool, existing *storage.Label, reqType *int32, reqActive *bool) appstate.PatchInfo {
+	listType := waSyncAction.LabelEditAction_CUSTOM
+	isActive := true
+	var predefinedID *int32
+	if existing != nil {
+		if existing.Type != nil && *existing.Type != 0 {
+			listType = waSyncAction.LabelEditAction_ListType(*existing.Type)
+		}
+		if existing.IsActive != nil {
+			isActive = *existing.IsActive
+		}
+		if existing.PredefinedID != 0 {
+			predefinedID = proto.Int32(existing.PredefinedID)
+		}
+	}
+	if reqType != nil && *reqType != 0 {
+		listType = waSyncAction.LabelEditAction_ListType(*reqType)
+	}
+	if reqActive != nil {
+		isActive = *reqActive
+	}
+	return appstate.PatchInfo{
+		Type: appstate.WAPatchRegular,
+		Mutations: []appstate.MutationInfo{{
+			Index:   []string{appstate.IndexLabelEdit, id},
+			Version: 3,
+			Value: &waSyncAction.SyncActionValue{
+				LabelEditAction: &waSyncAction.LabelEditAction{
+					Name:         proto.String(name),
+					Color:        proto.Int32(color),
+					Deleted:      proto.Bool(deleted),
+					IsActive:     proto.Bool(isActive),
+					Type:         listType.Enum(),
+					PredefinedID: predefinedID,
+				},
+			},
+		}},
+	}
+}
+
 // UpsertLabel implements the gRPC method to create or update a label
 func (s *Server) UpsertLabel(ctx context.Context, req *__.UpsertLabelRequest) (*__.Empty, error) {
 	cli, err := s.Sm.Get(req.Session.Id)
@@ -41,11 +88,8 @@ func (s *Server) UpsertLabel(ctx context.Context, req *__.UpsertLabelRequest) (*
 
 	// Send app state update for label edit
 	label := req.Label
-	var type_ *waSyncAction.LabelEditAction_ListType
-	if label.Type != nil {
-		type_ = waSyncAction.LabelEditAction_ListType(label.GetType()).Enum()
-	}
-	patch := appstate.BuildLabelEdit(label.Id, label.Name, label.Color, false, type_, label.IsActive)
+	existing, _ := cli.Storage.Labels.GetLabelById(label.Id)
+	patch := buildListEdit(label.Id, label.Name, label.Color, false, existing, label.Type, label.IsActive)
 	err = cli.SendAppState(ctx, patch)
 	if err != nil {
 		return nil, fmt.Errorf("error upserting label: %w", err)
@@ -62,7 +106,8 @@ func (s *Server) DeleteLabel(ctx context.Context, req *__.DeleteLabelRequest) (*
 
 	// Send app state update for label delete
 	label := req.Label
-	patch := appstate.BuildLabelEdit(label.Id, label.Name, label.Color, true, nil, nil)
+	existing, _ := cli.Storage.Labels.GetLabelById(label.Id)
+	patch := buildListEdit(label.Id, label.Name, label.Color, true, existing, nil, nil)
 	err = cli.SendAppState(ctx, patch)
 	if err != nil {
 		return nil, fmt.Errorf("error deleting label: %w", err)
@@ -79,10 +124,6 @@ func (s *Server) GetLabelsByJid(ctx context.Context, req *__.EntityByIdRequest) 
 	if err != nil {
 		return nil, fmt.Errorf("error parsing jid: %w", err)
 	}
-	labelIds, err := cli.Storage.LabelAssociations.GetLabelIDsByJID(jid)
-	if err != nil {
-		return nil, fmt.Errorf("error getting labels by jid: %w", err)
-	}
 	labels, err := cli.Storage.Labels.GetAllLabels()
 	if err != nil {
 		return nil, fmt.Errorf("error getting labels: %w", err)
@@ -92,13 +133,19 @@ func (s *Server) GetLabelsByJid(ctx context.Context, req *__.EntityByIdRequest) 
 		labelById[label.ID] = label
 	}
 	labelsForJid := make([]*storage.Label, 0)
-	for _, labelId := range labelIds {
-		// Skip associations whose label is not synced yet
-		label, ok := labelById[labelId]
-		if !ok {
-			continue
+	seen := make(map[string]bool)
+	for _, chat := range chatJIDs(ctx, cli, jid) {
+		labelIds, err := cli.Storage.LabelAssociations.GetLabelIDsByJID(chat)
+		if err != nil {
+			return nil, fmt.Errorf("error getting labels by jid: %w", err)
 		}
-		labelsForJid = append(labelsForJid, label)
+		for _, labelId := range labelIds {
+			// association can outlive its list (or arrive before it on sync)
+			if label := labelById[labelId]; label != nil && !seen[labelId] {
+				seen[labelId] = true
+				labelsForJid = append(labelsForJid, label)
+			}
+		}
 	}
 	response, err := toJsonList(labelsForJid)
 	if err != nil {
@@ -112,9 +159,23 @@ func (s *Server) GetChatsByLabelId(ctx context.Context, req *__.EntityByIdReques
 		return nil, err
 	}
 	labelId := req.Id
-	chats, err := cli.Storage.LabelAssociations.GetJIDsByLabelID(labelId)
+	jids, err := cli.Storage.LabelAssociations.GetJIDsByLabelID(labelId)
 	if err != nil {
 		return nil, fmt.Errorf("error getting chats by label id: %w", err)
+	}
+	// Lists may hold a chat by LID - report it by phone number when known, once
+	chats := make([]types.JID, 0, len(jids))
+	seen := make(map[types.JID]bool)
+	for _, jid := range jids {
+		if jid.Server == types.HiddenUserServer {
+			if pn, err := cli.ResolvePNByLid(ctx, jid); err == nil && !pn.IsEmpty() {
+				jid = pn
+			}
+		}
+		if !seen[jid] {
+			seen[jid] = true
+			chats = append(chats, jid)
+		}
 	}
 	response, err := toJsonList(chats)
 	if err != nil {
@@ -130,7 +191,19 @@ func (s *Server) AddChatLabel(ctx context.Context, req *__.ChatLabelRequest) (*_
 		return nil, err
 	}
 	jid, err := types.ParseJID(req.ChatId)
-	patch := appstate.BuildLabelChat(jid, req.LabelId, true)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing jid: %w", err)
+	}
+	// After the account's LID migration, linked devices (WA Web) key 1:1 chats by LID and
+	// ignore a list association sent for the phone number - the phone maps it, they don't.
+	target := jid
+	if cli.Store.LIDMigrationTimestamp > 0 && jid.Server == types.DefaultUserServer {
+		if lid, err := cli.ResolveLidByPN(ctx, jid); err == nil && !lid.IsEmpty() {
+			target = lid
+		}
+	}
+	cli.Log.Infof("Adding list %v to chat %v as %v (lid migration: %v)", req.LabelId, jid, target, cli.Store.LIDMigrationTimestamp)
+	patch := appstate.BuildLabelChat(target, req.LabelId, true)
 	err = cli.SendAppState(ctx, patch)
 	if err != nil {
 		return nil, fmt.Errorf("error adding label to chat: %w", err)
@@ -144,10 +217,41 @@ func (s *Server) RemoveChatLabel(ctx context.Context, req *__.ChatLabelRequest) 
 		return nil, err
 	}
 	jid, err := types.ParseJID(req.ChatId)
-	patch := appstate.BuildLabelChat(jid, req.LabelId, false)
-	err = cli.SendAppState(ctx, patch)
 	if err != nil {
-		return nil, fmt.Errorf("error removing label from chat: %w", err)
+		return nil, fmt.Errorf("error parsing jid: %w", err)
+	}
+	// Remove the association under whichever address (PN/LID) the list holds the chat
+	for _, chat := range chatJIDs(ctx, cli, jid) {
+		labelIds, _ := cli.Storage.LabelAssociations.GetLabelIDsByJID(chat)
+		if chat != jid && !slices.Contains(labelIds, req.LabelId) {
+			continue
+		}
+		patch := appstate.BuildLabelChat(chat, req.LabelId, false)
+		err = cli.SendAppState(ctx, patch)
+		if err != nil {
+			return nil, fmt.Errorf("error removing label from chat: %w", err)
+		}
 	}
 	return &__.Empty{}, nil
+}
+
+type lidResolver interface {
+	ResolveLidByPN(ctx context.Context, pn types.JID) (types.JID, error)
+	ResolvePNByLid(ctx context.Context, lid types.JID) (types.JID, error)
+}
+
+// chatJIDs returns the chat JID plus its PN/LID counterpart (local store, then server), if known.
+func chatJIDs(ctx context.Context, lids lidResolver, jid types.JID) []types.JID {
+	jids := []types.JID{jid}
+	var alt types.JID
+	switch jid.Server {
+	case types.DefaultUserServer:
+		alt, _ = lids.ResolveLidByPN(ctx, jid)
+	case types.HiddenUserServer:
+		alt, _ = lids.ResolvePNByLid(ctx, jid)
+	}
+	if !alt.IsEmpty() {
+		jids = append(jids, alt)
+	}
+	return jids
 }

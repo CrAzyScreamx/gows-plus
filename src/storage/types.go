@@ -96,6 +96,8 @@ type Label struct {
 	Color    int    `json:"color"`
 	Type     *int   `json:"type,omitempty"`
 	IsActive *bool  `json:"isActive,omitempty"`
+	// built-in lists only - kept on edit/delete so they stay intact
+	PredefinedID int32 `json:"predefinedId,omitempty"`
 }
 
 // LabelAssociation represents an association between a label and a JID
